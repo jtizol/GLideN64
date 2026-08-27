@@ -1,5 +1,20 @@
 #include <stdio.h>
 #include <cstdlib>
+// pinball_cab: GLIDEN64_STREAM_SOCKET support -- see the m_streamFd comment on
+// DisplayWindowMupen64plus below. Same technique, same wire protocol, and the same two bugs
+// already found and fixed for MAME's own equivalent patch (engine/mame/src/osd/modules/render/
+// drawogl.cpp) -- a blocking send() stalling the emulator's own render thread, and a
+// non-blocking send() still returning a PARTIAL byte count -- fixed here from the start rather
+// than rediscovered, since this is the exact same OS/socket-buffer-ceiling situation, not a
+// GLideN64-specific one.
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <algorithm>
+#include <vector>
 #include <Graphics/Context.h>
 #include <Graphics/OpenGLContext/GLFunctions.h>
 #include <Graphics/OpenGLContext/opengl_Utils.h>
@@ -44,6 +59,16 @@ private:
 	bool _supportsWithRateFunctions = true;
 #endif // M64P_GLIDENUI
 	graphics::ObjectHandle _getDefaultFramebuffer() override;
+
+	// pinball_cab: real gameplay video piped into cabinet-dashboard's Shared Playarea, the same
+	// in-process-capture approach (and wire protocol) as MAME's own MAME_STREAM_SOCKET patch --
+	// see drawogl.cpp's identical member comment and docs/decisions/emulators-and-mame.md. Only
+	// mupen64plus_DisplayWindow.cpp (this file, the actual frontend GLideN64 runs under here) is
+	// patched -- windows_DisplayWindow.cpp is a different platform entirely and this repo only
+	// builds for macOS via the mupen64plus frontend.
+	int m_streamFd = -1;
+	std::vector<uint8_t> m_streamPixels;   // glReadPixels scratch buffer, GL's bottom-up RGBA
+	std::vector<uint8_t> m_streamBuf;      // wire buffer: 8-byte header + row-flipped RGBA
 };
 
 DisplayWindow & DisplayWindow::get()
@@ -115,6 +140,45 @@ bool DisplayWindowMupen64plus::_start()
 		return false;
 	}
 
+	// pinball_cab: connect to the dashboard's frame-receiving socket if launch-n64.py set one
+	// up for us -- see the m_streamFd comment in the class declaration above. Connected once
+	// per launch here (video-system startup), not in the trivial default constructor, mirroring
+	// this same lifecycle point already being where CoreVideo_Init/_setAttributes happen.
+	if (const char *sockPath = std::getenv("GLIDEN64_STREAM_SOCKET"))
+	{
+		m_streamFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+		if (m_streamFd >= 0)
+		{
+			struct sockaddr_un addr{};
+			addr.sun_family = AF_UNIX;
+			std::strncpy(addr.sun_path, sockPath, sizeof(addr.sun_path) - 1);
+			if (::connect(m_streamFd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0)
+			{
+				::close(m_streamFd);
+				m_streamFd = -1;
+			}
+			else
+			{
+				// See MAME's drawogl.cpp for the identical comment: without this, a send() after
+				// the dashboard's reader has gone away raises SIGPIPE, whose default disposition
+				// kills the whole process.
+				int one = 1;
+				::setsockopt(m_streamFd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+				// Non-blocking, same reasoning as MAME's own patch: this render thread IS
+				// mupen64plus's emulation thread too (renderCallback runs from inside
+				// _swapBuffers, same call site the frame capture below sits next to), so a
+				// blocking send() here would stall gameplay itself, not just the video path.
+				int flags = ::fcntl(m_streamFd, F_GETFL, 0);
+				::fcntl(m_streamFd, F_SETFL, flags | O_NONBLOCK);
+
+				// Best-effort send buffer, same sizing/reasoning as MAME's patch.
+				int sndbuf = 8 * 1024 * 1024;
+				::setsockopt(m_streamFd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+			}
+		}
+	}
+
 	char caption[128];
 #ifdef PLUGIN_REVISION
 # ifdef _DEBUG
@@ -136,6 +200,11 @@ bool DisplayWindowMupen64plus::_start()
 
 void DisplayWindowMupen64plus::_stop()
 {
+	if (m_streamFd >= 0)
+	{
+		::close(m_streamFd);
+		m_streamFd = -1;
+	}
 	FunctionWrapper::CoreVideo_Quit();
 }
 
@@ -158,6 +227,68 @@ void DisplayWindowMupen64plus::_swapBuffers()
 		}
 		gDP.changed |= CHANGED_COMBINE;
 		(*renderCallback)((gDP.changed&CHANGED_CPU_FB_WRITE) == 0 ? 1 : 0);
+	}
+
+	// pinball_cab: capture the completed frame for the dashboard BEFORE swapping -- GL_BACK
+	// still holds exactly what was just drawn at this point, same reasoning as MAME's identical
+	// capture point in drawogl.cpp::draw(). Reads from m_heightOffset, not row 0, matching
+	// _readScreen2()'s own existing capture above -- some titles render into a sub-rect of the
+	// window (letterboxing), and starting at row 0 would capture the wrong rows/black bars for
+	// those. See docs/decisions/emulators-and-mame.md for the wire protocol and the two bugs
+	// (blocking send stalls the emulator; a non-blocking send can still be PARTIAL) this
+	// duplicates the fix for rather than rediscovering.
+	if (m_streamFd >= 0 && m_screenWidth > 0 && m_screenHeight > 0)
+	{
+		constexpr int STREAM_OUT_W = 480;
+		constexpr int STREAM_OUT_H = 270;
+
+		const size_t srcFrameBytes = size_t(m_screenWidth) * size_t(m_screenHeight) * 4;
+		m_streamPixels.resize(srcFrameBytes);
+		glPixelStorei(GL_PACK_ALIGNMENT, 1); // RGBA is already 4-byte aligned per pixel, but
+		                                      // matches _readScreen2()'s own explicit set rather
+		                                      // than relying on whatever the driver defaulted to.
+		glReadPixels(0, m_heightOffset, m_screenWidth, m_screenHeight, GL_RGBA, GL_UNSIGNED_BYTE, m_streamPixels.data());
+
+		const size_t outFrameBytes = size_t(STREAM_OUT_W) * size_t(STREAM_OUT_H) * 4;
+		m_streamBuf.resize(8 + outFrameBytes);
+		m_streamBuf[0] = uint8_t(STREAM_OUT_W >> 24); m_streamBuf[1] = uint8_t(STREAM_OUT_W >> 16);
+		m_streamBuf[2] = uint8_t(STREAM_OUT_W >> 8);  m_streamBuf[3] = uint8_t(STREAM_OUT_W);
+		m_streamBuf[4] = uint8_t(STREAM_OUT_H >> 24); m_streamBuf[5] = uint8_t(STREAM_OUT_H >> 16);
+		m_streamBuf[6] = uint8_t(STREAM_OUT_H >> 8);  m_streamBuf[7] = uint8_t(STREAM_OUT_H);
+		const size_t srcRowBytes = size_t(m_screenWidth) * 4;
+		uint8_t *dst = m_streamBuf.data() + 8;
+		for (int dy = 0; dy < STREAM_OUT_H; dy++)
+		{
+			// (STREAM_OUT_H - 1 - dy): output row 0 is the TOP of the image; glReadPixels' row 0
+			// is the BOTTOM (OpenGL convention) -- this both flips and downscales in one pass,
+			// same technique as MAME's drawogl.cpp.
+			const unsigned int srcY = std::min(m_screenHeight - 1, (unsigned int)(((STREAM_OUT_H - 1 - dy) * (long long)m_screenHeight) / STREAM_OUT_H));
+			const uint8_t *srcRow = m_streamPixels.data() + srcRowBytes * size_t(srcY);
+			for (int dx = 0; dx < STREAM_OUT_W; dx++)
+			{
+				const unsigned int srcX = std::min(m_screenWidth - 1, (unsigned int)((dx * (long long)m_screenWidth) / STREAM_OUT_W));
+				std::memcpy(dst, srcRow + size_t(srcX) * 4, 4);
+				dst += 4;
+			}
+		}
+
+		// ONE non-blocking send attempt, all-or-nothing -- same reasoning as MAME's drawogl.cpp:
+		// a full send loop would block this render thread (mupen64plus's emulation thread) until
+		// the kernel socket buffer drains, and a "successful" non-blocking send can still return
+		// a PARTIAL byte count, which would silently corrupt this wire format's framing forever
+		// after (no mid-frame resync marker). Anything other than a complete send is treated as
+		// fatal to this connection -- close it, don't try to resume mid-frame.
+		ssize_t n = ::send(m_streamFd, m_streamBuf.data(), m_streamBuf.size(), MSG_DONTWAIT);
+		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			::close(m_streamFd);
+			m_streamFd = -1;
+		}
+		else if (n > 0 && size_t(n) != m_streamBuf.size())
+		{
+			::close(m_streamFd);
+			m_streamFd = -1;
+		}
 	}
 
 	//Don't let the command queue grow too big buy waiting on no more swap buffers being queued
