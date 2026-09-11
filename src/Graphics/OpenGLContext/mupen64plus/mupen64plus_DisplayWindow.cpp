@@ -81,6 +81,43 @@ private:
 	std::vector<double> m_perfFrameMs;
 	std::chrono::steady_clock::time_point m_perfLast{}, m_perfWindowStart{};
 	void _samplePerf();
+
+	// pinball_cab: SPRITES DRAWN INTO THE GAME'S OWN FRAME.
+	//
+	// The cabinet wants to put its own things on the screen during a game -- whose turn it is,
+	// an avatar beside a score -- and the obvious route, a transparent window floating on top,
+	// has a hard limit that only shows up in use: a mirror of the GAME's window never contains
+	// it. Window capture copies that window's buffer, and an overlay is by definition a
+	// different window. It also means a second video path (the streamed copy) running just to
+	// have something to draw on, which costs frames on a skill game.
+	//
+	// Drawing here instead makes the badge part of the picture: it is in the window, in any
+	// mirror of it, in the stream, and in a screenshot, with no second copy of anything and no
+	// latency at all. Composited BEFORE the stream capture below, deliberately, so the phone and
+	// the cabinet see the same frame rather than two versions of it.
+	//
+	// The dashboard decides what and where (it knows the avatars, the per-game placement in
+	// game-data.json, and whose turn it is); this end just blits what it is told, in framebuffer
+	// pixels. That split is what makes it reusable: a new overlay for a new game is data, not
+	// another C++ patch.
+	struct Sprite {
+		int id = 0;
+		// Placement is FRACTIONS of the framebuffer, y from the top -- not pixels. The dashboard
+		// cannot know this buffer's pixel size (a Retina drawable is twice its window's points,
+		// and the stream it otherwise sees is downscaled to a fixed 960x540), so pixels would be
+		// right on one display and wrong on another. Fractions need no negotiation at all.
+		float fx = 0.f, fy = 0.f, fw = 0.f, fh = 0.f;
+		int pxw = 0, pxh = 0;                 // the IMAGE's own size, to read the file
+		std::vector<uint8_t> rgba;            // pxw*pxh*4, straight alpha
+		bool dirty = true;                    // needs (re)upload to its texture
+		unsigned int tex = 0;
+	};
+	std::vector<Sprite> m_sprites;
+	std::string m_cmdBuf;                     // partial command line from the socket
+	unsigned int m_spriteProgram = 0, m_spriteVao = 0, m_spriteVbo = 0;
+	bool m_spriteInitFailed = false;
+	void _pollSpriteCommands();
+	void _drawSprites();
 };
 
 DisplayWindow & DisplayWindow::get()
@@ -120,6 +157,220 @@ void DisplayWindowMupen64plus::_samplePerf()
 	std::fflush(stdout);
 	m_perfFrameMs.clear();
 	m_perfWindowStart = now;
+}
+
+// pinball_cab: the sprite compositor. See the Sprite member comment for why this draws into the
+// game's frame rather than a window over it.
+//
+// GL 3.3 core (this file's own _setAttributes asks for it), so there is no fixed-function path:
+// one tiny program, one VAO, one dynamic VBO, and a texture per sprite. Every GL call goes
+// through GLideN64's own wrappers (GLFunctions.h macros) exactly like the rest of this file --
+// the threaded-GL wrapper is not optional, and calling raw gl* here would work until someone
+// enabled it.
+//
+// STATE IS SAVED AND RESTORED around the draw. GLideN64 is mid-pipeline when this runs and does
+// not expect anyone else to have touched the context; leaving blending on (or a program bound)
+// would corrupt the NEXT frame in ways that look like a renderer bug, not an overlay bug.
+static const char *kSpriteVs =
+	"#version 330 core\n"
+	"layout(location=0) in vec2 aPos;\n"
+	"layout(location=1) in vec2 aUv;\n"
+	"out vec2 vUv;\n"
+	"void main(){ vUv = aUv; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+static const char *kSpriteFs =
+	"#version 330 core\n"
+	"in vec2 vUv;\n"
+	"uniform sampler2D uTex;\n"
+	"out vec4 fragColor;\n"
+	"void main(){ fragColor = texture(uTex, vUv); }\n";
+
+static unsigned int _compile(unsigned int type, const char *src)
+{
+	unsigned int sh = glCreateShader(type);
+	glShaderSource(sh, 1, &src, nullptr);
+	glCompileShader(sh);
+	GLint ok = 0;
+	glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[512] = {0};
+		glGetShaderInfoLog(sh, sizeof(log) - 1, nullptr, log);
+		std::printf("sprite shader failed: %s\n", log);
+		std::fflush(stdout);
+		glDeleteShader(sh);
+		return 0;
+	}
+	return sh;
+}
+
+void DisplayWindowMupen64plus::_drawSprites()
+{
+	if (m_sprites.empty() || m_spriteInitFailed)
+		return;
+
+	if (m_spriteProgram == 0) {
+		unsigned int vs = _compile(GL_VERTEX_SHADER, kSpriteVs);
+		unsigned int fs = _compile(GL_FRAGMENT_SHADER, kSpriteFs);
+		if (vs == 0 || fs == 0) { m_spriteInitFailed = true; return; }
+		m_spriteProgram = glCreateProgram();
+		glAttachShader(m_spriteProgram, vs);
+		glAttachShader(m_spriteProgram, fs);
+		glLinkProgram(m_spriteProgram);
+		glDeleteShader(vs);
+		glDeleteShader(fs);
+		GLint ok = 0;
+		glGetProgramiv(m_spriteProgram, GL_LINK_STATUS, &ok);
+		if (!ok) { m_spriteInitFailed = true; return; }
+		glGenVertexArrays(1, &m_spriteVao);
+		glGenBuffers(1, &m_spriteVbo);
+		glBindVertexArray(m_spriteVao);
+		glBindBuffer(GL_ARRAY_BUFFER, m_spriteVbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 24, nullptr, GL_DYNAMIC_DRAW);
+		glEnableVertexAttribArray(0);
+		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4, (const GLvoid *)0);
+		glEnableVertexAttribArray(1);
+		glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4,
+			(const GLvoid *)(sizeof(float) * 2));
+		glBindVertexArray(0);
+	}
+
+	// What we are about to change, so it can be put back exactly.
+	GLboolean wasBlend = glIsEnabled(GL_BLEND);
+	GLboolean wasDepth = glIsEnabled(GL_DEPTH_TEST);
+	GLint prevProgram = 0, prevVao = 0, prevTex = 0, prevFbo = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
+	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+
+	// The DEFAULT framebuffer, not whatever GLideN64 last bound: the badge belongs on the image
+	// about to be shown, not on one of the renderer's intermediate targets.
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	glDisable(GL_DEPTH_TEST);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glUseProgram(m_spriteProgram);
+	glBindVertexArray(m_spriteVao);
+	glBindBuffer(GL_ARRAY_BUFFER, m_spriteVbo);
+
+	for (Sprite &sp : m_sprites) {
+		if (sp.pxw <= 0 || sp.pxh <= 0 || sp.rgba.size() < (size_t)sp.pxw * sp.pxh * 4)
+			continue;
+		if (sp.tex == 0)
+			glGenTextures(1, &sp.tex);
+		glBindTexture(GL_TEXTURE_2D, sp.tex);
+		if (sp.dirty) {
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sp.pxw, sp.pxh, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+				sp.rgba.data());
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			sp.dirty = false;
+		}
+
+		// Fractions (y from the top, as every caller thinks of a screen) -> clip space.
+		const float x0 = sp.fx * 2.f - 1.f;
+		const float x1 = (sp.fx + sp.fw) * 2.f - 1.f;
+		const float y0 = 1.f - sp.fy * 2.f;
+		const float y1 = 1.f - (sp.fy + sp.fh) * 2.f;
+		const float verts[24] = {
+			x0, y0, 0.f, 0.f,   x1, y0, 1.f, 0.f,   x1, y1, 1.f, 1.f,
+			x0, y0, 0.f, 0.f,   x1, y1, 1.f, 1.f,   x0, y1, 0.f, 1.f,
+		};
+		glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+		glDrawArrays(GL_TRIANGLES, 0, 6);
+	}
+
+	glBindVertexArray(prevVao);
+	glBindTexture(GL_TEXTURE_2D, prevTex);
+	glUseProgram(prevProgram);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevFbo);
+	if (!wasBlend) glDisable(GL_BLEND);
+	if (wasDepth) glEnable(GL_DEPTH_TEST);
+}
+
+// Commands from the dashboard, on the SAME socket the frames go out on -- it is already
+// connected, already non-blocking, and already touched every frame. See state_tap.c, which made
+// the same call for the same reasons.
+//
+//   sprite <id> <fx> <fy> <fw> <fh> <pxw> <pxh> <path>
+//       fx..fh  placement, as fractions of the framebuffer (y from the top)
+//       pxw/pxh the image's own pixel size
+//       path    a raw RGBA file, pxw*pxh*4 bytes
+//   clear <id>
+//   clear-all
+void DisplayWindowMupen64plus::_pollSpriteCommands()
+{
+	if (m_streamFd < 0)
+		return;
+	for (;;) {
+		char chunk[512];
+		ssize_t n = ::recv(m_streamFd, chunk, sizeof(chunk), MSG_DONTWAIT);
+		if (n <= 0)
+			return;                  // EAGAIN is the normal case: nobody sends most frames
+		m_cmdBuf.append(chunk, (size_t)n);
+		for (;;) {
+			const size_t nl = m_cmdBuf.find('\n');
+			if (nl == std::string::npos) {
+				// A caller that never sends a newline must not grow this without bound.
+				if (m_cmdBuf.size() > 4096)
+					m_cmdBuf.clear();
+				break;
+			}
+			const std::string line = m_cmdBuf.substr(0, nl);
+			m_cmdBuf.erase(0, nl + 1);
+			int id = 0, pxw = 0, pxh = 0;
+			float fx = 0.f, fy = 0.f, fw = 0.f, fh = 0.f;
+			char path[512] = {0};
+			if (std::sscanf(line.c_str(), "sprite %d %f %f %f %f %d %d %511s",
+					&id, &fx, &fy, &fw, &fh, &pxw, &pxh, path) == 8) {
+				std::vector<uint8_t> rgba((size_t)pxw * pxh * 4);
+				FILE *f = std::fopen(path, "rb");
+				if (f == nullptr) {
+					std::printf("sprite %d: cannot open %s\n", id, path);
+					std::fflush(stdout);
+					continue;
+				}
+				const size_t got = std::fread(rgba.data(), 1, rgba.size(), f);
+				std::fclose(f);
+				if (got != rgba.size()) {
+					std::printf("sprite %d: short read (%zu of %zu) from %s\n",
+						id, got, rgba.size(), path);
+					std::fflush(stdout);
+					continue;        // a half-written file is never a sprite
+				}
+				std::printf("sprite %d accepted %dx%d at %.3f,%.3f %.3fx%.3f\n",
+					id, pxw, pxh, fx, fy, fw, fh);
+				std::fflush(stdout);
+				Sprite *found = nullptr;
+				for (Sprite &sp : m_sprites)
+					if (sp.id == id) { found = &sp; break; }
+				if (found == nullptr) {
+					m_sprites.push_back(Sprite());
+					found = &m_sprites.back();
+					found->id = id;
+				}
+				found->fx = fx; found->fy = fy; found->fw = fw; found->fh = fh;
+				found->pxw = pxw; found->pxh = pxh;
+				found->rgba.swap(rgba);
+				found->dirty = true;
+			} else if (std::sscanf(line.c_str(), "clear %d", &id) == 1) {
+				for (size_t i = 0; i < m_sprites.size(); i++) {
+					if (m_sprites[i].id == id) {
+						if (m_sprites[i].tex != 0)
+							glDeleteTextures(1, &m_sprites[i].tex);
+						m_sprites.erase(m_sprites.begin() + i);
+						break;
+					}
+				}
+			} else if (line.rfind("clear-all", 0) == 0) {
+				for (Sprite &sp : m_sprites)
+					if (sp.tex != 0) glDeleteTextures(1, &sp.tex);
+				m_sprites.clear();
+			}
+		}
+	}
 }
 
 void DisplayWindowMupen64plus::_setAttributes()
@@ -283,6 +534,11 @@ void DisplayWindowMupen64plus::_swapBuffers()
 	// (blocking send stalls the emulator; a non-blocking send can still be PARTIAL) this
 	// duplicates the fix for rather than rediscovering.
 	_samplePerf();
+
+	// Commands first, then draw, then capture -- so a sprite that arrived this frame is on the
+	// picture the stream sends, not one frame behind it.
+	_pollSpriteCommands();
+	_drawSprites();
 
 	if (m_streamFd >= 0 && m_screenWidth > 0 && m_screenHeight > 0)
 	{
