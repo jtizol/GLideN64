@@ -69,12 +69,57 @@ private:
 	int m_streamFd = -1;
 	std::vector<uint8_t> m_streamPixels;   // glReadPixels scratch buffer, GL's bottom-up RGBA
 	std::vector<uint8_t> m_streamBuf;      // wire buffer: 8-byte header + row-flipped RGBA
+
+	// pinball_cab: frame-time sampler. A report of "a slight repeatable lag in Mario Golf's shot
+	// camera" could not be answered at all -- there was no performance data from a real session
+	// anywhere, only guesses about which of several plausible causes it was. This is the cheapest
+	// possible fix: we are already in the swap path every frame for the video stream above, so
+	// timing it costs one clock read per frame. Percentiles, not an average: a stutter is
+	// exactly the tail an average hides.
+	// Same `perf ` line shape as the MAME and VPX samplers -- one format, one parser, checked by
+	// scripts/check-perf-logging.py.
+	std::vector<double> m_perfFrameMs;
+	std::chrono::steady_clock::time_point m_perfLast{}, m_perfWindowStart{};
+	void _samplePerf();
 };
 
 DisplayWindow & DisplayWindow::get()
 {
 	static DisplayWindowMupen64plus video;
 	return video;
+}
+
+// pinball_cab: see the m_perfFrameMs comment in the class declaration for why this exists.
+// Every PERF_WINDOW_S it prints one line and starts over; the vector never grows past a window.
+// fprintf + fflush, not std::cout: this has to survive a `pkill -9` (the cabinet's normal way of
+// stopping a game), which is also why scripts/logtee.py hands us a PTY.
+void DisplayWindowMupen64plus::_samplePerf()
+{
+	constexpr double PERF_WINDOW_S = 10.0;
+	const auto now = std::chrono::steady_clock::now();
+	if (m_perfLast.time_since_epoch().count() != 0) {
+		m_perfFrameMs.push_back(std::chrono::duration<double, std::milli>(now - m_perfLast).count());
+	} else {
+		m_perfWindowStart = now;
+	}
+	m_perfLast = now;
+
+	const double windowS = std::chrono::duration<double>(now - m_perfWindowStart).count();
+	if (windowS < PERF_WINDOW_S || m_perfFrameMs.size() < 2)
+		return;
+
+	std::vector<double> sorted = m_perfFrameMs;
+	std::sort(sorted.begin(), sorted.end());
+	const auto pct = [&sorted](double p) {
+		const size_t i = std::min(sorted.size() - 1, static_cast<size_t>(p * sorted.size()));
+		return sorted[i];
+	};
+	std::printf("perf fps=%.1f ms_p50=%.1f ms_p95=%.1f ms_max=%.1f n=%zu window_s=%.1f\n",
+		static_cast<double>(sorted.size()) / windowS, pct(0.50), pct(0.95), sorted.back(),
+		sorted.size(), windowS);
+	std::fflush(stdout);
+	m_perfFrameMs.clear();
+	m_perfWindowStart = now;
 }
 
 void DisplayWindowMupen64plus::_setAttributes()
@@ -237,6 +282,8 @@ void DisplayWindowMupen64plus::_swapBuffers()
 	// those. See docs/decisions/emulators-and-mame.md for the wire protocol and the two bugs
 	// (blocking send stalls the emulator; a non-blocking send can still be PARTIAL) this
 	// duplicates the fix for rather than rediscovering.
+	_samplePerf();
+
 	if (m_streamFd >= 0 && m_screenWidth > 0 && m_screenHeight > 0)
 	{
 		constexpr int STREAM_OUT_W = 480;
