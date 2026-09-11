@@ -233,21 +233,61 @@ void DisplayWindowMupen64plus::_drawSprites()
 		glBindVertexArray(0);
 	}
 
-	// What we are about to change, so it can be put back exactly.
+	// EVERY piece of state this touches, saved so it can be put back exactly.
+	//
+	// The first version of this saved four things and looked fine. It was corrupting the GAME's
+	// rendering: the black boxes that appeared behind Mario Golf's white text were our
+	// glBlendFunc left set, and the badge itself came out as a CRESCENT on screens where
+	// GLideN64 had left a scissor box smaller than the window. Neither failure points at this
+	// function -- they look like the emulator being broken -- so the rule here is to save
+	// anything touched, not anything believed to matter.
+	//
+	// GL_ARRAY_BUFFER is the subtle one: it is NOT part of vertex-array-object state, so
+	// restoring the VAO does not restore it, and GLideN64's next glBufferSubData would have
+	// landed in our vertex buffer.
 	GLboolean wasBlend = glIsEnabled(GL_BLEND);
 	GLboolean wasDepth = glIsEnabled(GL_DEPTH_TEST);
-	GLint prevProgram = 0, prevVao = 0, prevTex = 0, prevFbo = 0;
+	GLboolean wasScissor = glIsEnabled(GL_SCISSOR_TEST);
+	GLboolean wasCull = glIsEnabled(GL_CULL_FACE);
+	GLint prevProgram = 0, prevVao = 0, prevTex = 0, prevFbo = 0, prevArrayBuf = 0;
+	GLint prevActiveTex = GL_TEXTURE0, prevUnpack = 4;
+	GLint prevSrcRgb = GL_ONE, prevDstRgb = GL_ZERO, prevSrcA = GL_ONE, prevDstA = GL_ZERO;
+	GLint prevEqRgb = GL_FUNC_ADD, prevEqA = GL_FUNC_ADD;
+	GLint prevViewport[4] = { 0, 0, 0, 0 };
+	GLboolean prevColorMask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
 	glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
 	glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
 	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+	glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prevArrayBuf);
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTex);
+	glGetIntegerv(GL_UNPACK_ALIGNMENT, &prevUnpack);
+	glGetIntegerv(GL_BLEND_SRC_RGB, &prevSrcRgb);
+	glGetIntegerv(GL_BLEND_DST_RGB, &prevDstRgb);
+	glGetIntegerv(GL_BLEND_SRC_ALPHA, &prevSrcA);
+	glGetIntegerv(GL_BLEND_DST_ALPHA, &prevDstA);
+	glGetIntegerv(GL_BLEND_EQUATION_RGB, &prevEqRgb);
+	glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &prevEqA);
+	glGetIntegerv(GL_VIEWPORT, prevViewport);
+	glGetBooleanv(GL_COLOR_WRITEMASK, prevColorMask);
 
 	// The DEFAULT framebuffer, not whatever GLideN64 last bound: the badge belongs on the image
 	// about to be shown, not on one of the renderer's intermediate targets.
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+	// The same rectangle the frame stream reads back, so a fraction means the same thing to the
+	// dashboard, to the captured still, and to the cabinet's screen. Inheriting whatever
+	// viewport the renderer happened to leave set made placement depend on the last thing the
+	// GAME drew.
+	if (m_screenWidth > 0 && m_screenHeight > 0)
+		glViewport(0, m_heightOffset, m_screenWidth, m_screenHeight);
 	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glDisable(GL_CULL_FACE);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	glEnable(GL_BLEND);
+	glBlendEquation(GL_FUNC_ADD);
 	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glActiveTexture(GL_TEXTURE0);
 	glUseProgram(m_spriteProgram);
 	glBindVertexArray(m_spriteVao);
 	glBindBuffer(GL_ARRAY_BUFFER, m_spriteVbo);
@@ -282,12 +322,22 @@ void DisplayWindowMupen64plus::_drawSprites()
 		glDrawArrays(GL_TRIANGLES, 0, 6);
 	}
 
-	glBindVertexArray(prevVao);
+	// Put it all back, in the reverse of the order it was taken.
+	glPixelStorei(GL_UNPACK_ALIGNMENT, prevUnpack);
 	glBindTexture(GL_TEXTURE_2D, prevTex);
+	glActiveTexture((GLenum)prevActiveTex);
+	glBindBuffer(GL_ARRAY_BUFFER, prevArrayBuf);
+	glBindVertexArray(prevVao);
 	glUseProgram(prevProgram);
 	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevFbo);
+	glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+	glColorMask(prevColorMask[0], prevColorMask[1], prevColorMask[2], prevColorMask[3]);
+	glBlendEquationSeparate((GLenum)prevEqRgb, (GLenum)prevEqA);
+	glBlendFuncSeparate((GLenum)prevSrcRgb, (GLenum)prevDstRgb, (GLenum)prevSrcA, (GLenum)prevDstA);
 	if (!wasBlend) glDisable(GL_BLEND);
 	if (wasDepth) glEnable(GL_DEPTH_TEST);
+	if (wasScissor) glEnable(GL_SCISSOR_TEST);
+	if (wasCull) glEnable(GL_CULL_FACE);
 }
 
 // Commands from the dashboard, on the SAME socket the frames go out on -- it is already
