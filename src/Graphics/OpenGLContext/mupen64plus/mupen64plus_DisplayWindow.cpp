@@ -67,6 +67,8 @@ private:
 	// patched -- windows_DisplayWindow.cpp is a different platform entirely and this repo only
 	// builds for macOS via the mupen64plus frontend.
 	int m_streamFd = -1;
+	std::string m_streamPath;          // kept so the connection can be remade
+	unsigned int m_streamRetryAt = 0;  // swap counter of the next reconnect attempt
 	std::vector<uint8_t> m_streamPixels;   // glReadPixels scratch buffer, GL's bottom-up RGBA
 	std::vector<uint8_t> m_streamBuf;      // wire buffer: 8-byte header + row-flipped RGBA
 
@@ -118,6 +120,7 @@ private:
 	bool m_spriteInitFailed = false;
 	void _pollSpriteCommands();
 	void _drawSprites();
+	void _connectStream();
 };
 
 DisplayWindow & DisplayWindow::get()
@@ -491,39 +494,8 @@ bool DisplayWindowMupen64plus::_start()
 	// per launch here (video-system startup), not in the trivial default constructor, mirroring
 	// this same lifecycle point already being where CoreVideo_Init/_setAttributes happen.
 	if (const char *sockPath = std::getenv("GLIDEN64_STREAM_SOCKET"))
-	{
-		m_streamFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-		if (m_streamFd >= 0)
-		{
-			struct sockaddr_un addr{};
-			addr.sun_family = AF_UNIX;
-			std::strncpy(addr.sun_path, sockPath, sizeof(addr.sun_path) - 1);
-			if (::connect(m_streamFd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0)
-			{
-				::close(m_streamFd);
-				m_streamFd = -1;
-			}
-			else
-			{
-				// See MAME's drawogl.cpp for the identical comment: without this, a send() after
-				// the dashboard's reader has gone away raises SIGPIPE, whose default disposition
-				// kills the whole process.
-				int one = 1;
-				::setsockopt(m_streamFd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
-
-				// Non-blocking, same reasoning as MAME's own patch: this render thread IS
-				// mupen64plus's emulation thread too (renderCallback runs from inside
-				// _swapBuffers, same call site the frame capture below sits next to), so a
-				// blocking send() here would stall gameplay itself, not just the video path.
-				int flags = ::fcntl(m_streamFd, F_GETFL, 0);
-				::fcntl(m_streamFd, F_SETFL, flags | O_NONBLOCK);
-
-				// Best-effort send buffer, same sizing/reasoning as MAME's patch.
-				int sndbuf = 8 * 1024 * 1024;
-				::setsockopt(m_streamFd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-			}
-		}
-	}
+		m_streamPath = sockPath;
+	_connectStream();
 
 	char caption[128];
 #ifdef PLUGIN_REVISION
@@ -542,6 +514,52 @@ bool DisplayWindowMupen64plus::_start()
 	CoreVideo_SetCaption(caption);
 
 	return true;
+}
+
+// pinball_cab: (re)connect to the dashboard's frame socket.
+//
+// This used to happen exactly once, at video-system startup. The dashboard is restarted often --
+// a code change, a crash, a port already in use -- and a single connect meant a running game
+// lost its overlay and its frame stream for the rest of the session every time, with no symptom
+// pointing at the cause. Retried from the swap path instead, roughly every two seconds.
+void DisplayWindowMupen64plus::_connectStream()
+{
+	if (m_streamFd >= 0 || m_streamPath.empty())
+		return;
+
+	int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return;
+
+	struct sockaddr_un addr{};
+	addr.sun_family = AF_UNIX;
+	std::strncpy(addr.sun_path, m_streamPath.c_str(), sizeof(addr.sun_path) - 1);
+	if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+		::close(fd);
+		return;                 // deliberately silent: this runs every ~2s while nobody listens
+	}
+
+	// See MAME's drawogl.cpp for the identical comment: without this, a send() after the
+	// dashboard's reader has gone away raises SIGPIPE, whose default disposition kills the
+	// whole process.
+	int one = 1;
+	::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+	// Non-blocking, same reasoning as MAME's own patch: this render thread IS mupen64plus's
+	// emulation thread too, so a blocking send() here would stall gameplay itself.
+	int flags = ::fcntl(fd, F_GETFL, 0);
+	::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+	int sndbuf = 8 * 1024 * 1024;
+	::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+	m_streamFd = fd;
+	// Sprites live on the dashboard's side of this socket; a new listener has no idea what was
+	// on screen, so drop what we are drawing and let it tell us again.
+	m_sprites.clear();
+	m_cmdBuf.clear();
+	printf("gliden64: frame stream (re)connected to %s\n", m_streamPath.c_str());
+	fflush(stdout);
 }
 
 void DisplayWindowMupen64plus::_stop()
@@ -584,6 +602,14 @@ void DisplayWindowMupen64plus::_swapBuffers()
 	// (blocking send stalls the emulator; a non-blocking send can still be PARTIAL) this
 	// duplicates the fix for rather than rediscovering.
 	_samplePerf();
+
+	// Reconnect if the dashboard went away and came back. Every ~2s at 60fps: cheap enough that
+	// a connect() against a missing socket costs nothing, frequent enough that a server restart
+	// costs a couple of seconds of overlay rather than the rest of the session.
+	if (m_streamFd < 0 && !m_streamPath.empty() && ++m_streamRetryAt >= 120) {
+		m_streamRetryAt = 0;
+		_connectStream();
+	}
 
 	// Commands first, then draw, then capture -- so a sprite that arrived this frame is on the
 	// picture the stream sends, not one frame behind it.
